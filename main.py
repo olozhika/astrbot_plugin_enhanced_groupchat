@@ -138,10 +138,16 @@ class EnhancedGroupChatPlugin(Star):
         if has_at_bot:
             return
 
-        # 获取发言人的群名片或昵称
-        sender_name = event.sender_name or event.user_id
-        if hasattr(event.message_obj, "sender") and event.message_obj.sender:
-            sender_name = event.message_obj.sender.nickname or event.message_obj.sender.user_id or sender_name
+        # 获取发言人的群名片或昵称与用户 ID
+        sender_id = event.get_sender_id() if hasattr(event, "get_sender_id") else getattr(event, "user_id", "Unknown")
+        sender_name = event.get_sender_name() if hasattr(event, "get_sender_name") else None
+        
+        if not sender_name:
+            if hasattr(event.message_obj, "sender") and event.message_obj.sender:
+                sender_name = event.message_obj.sender.nickname or event.message_obj.sender.user_id
+        
+        if not sender_name:
+            sender_name = sender_id
 
         formatted_msg = f"[{sender_name}]: {event.message_str}"
 
@@ -164,7 +170,7 @@ class EnhancedGroupChatPlugin(Star):
                 "content": [
                     {
                         "type": "text",
-                        "text": f"<system_reminder>User ID: {event.user_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>"
+                        "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>"
                     },
                     {
                         "type": "text",
@@ -243,7 +249,7 @@ class EnhancedGroupChatPlugin(Star):
                 "content": [
                     {
                         "type": "text",
-                        "text": f"<system_reminder>User ID: {event.user_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>"
+                        "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>"
                     },
                     {
                         "type": "text",
