@@ -174,7 +174,7 @@ class EnhancedGroupChatPlugin(Star):
                     },
                     {
                         "type": "text",
-                        "text": formatted_msg
+                        "text": event.message_str
                     }
                 ]
             }
@@ -232,14 +232,14 @@ class EnhancedGroupChatPlugin(Star):
             # 如果触发了回复，我们将此格式化的消息直接当做此次 LLM 请求的最完美 Prompt
             # 原生在请求结束及返回回复时，会自动帮我们把该 prompt 和 AI 回复同步追加进 conversation 库中。
             yield event.request_llm(
-                prompt=formatted_msg,
+                prompt=event.message_str,
                 conversation=conv
             )
         else:
             # 如果不应回复该条消息，我们必须在底层静默、默默无闻地将其记录至当前会话的对话历史，
             # 完美地让 AI 在随后的任何时机有充足的历史作为闲聊戏剧文本参考。
             # 构造附带优雅 <system_reminder> 的双 block 消息体，既符合 LLM 的系统前缀读取设计，
-            # 也能让 local_reminiscence 的聊天记录导出提取器正确地提取发言用户的 Nickname、时间戳和完整的剧本格式内容。
+            # 也能让 local_reminiscence 的聊天记录导出提取器正确地提取发言用户的 Nickname、时间戳 and 完整的剧本格式内容。
             history = conv.content or []
             now_dt = datetime.now()
             now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -253,7 +253,7 @@ class EnhancedGroupChatPlugin(Star):
                     },
                     {
                         "type": "text",
-                        "text": formatted_msg
+                        "text": event.message_str
                     }
                 ]
             })
