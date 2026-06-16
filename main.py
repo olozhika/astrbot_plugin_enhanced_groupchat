@@ -12,7 +12,7 @@ from astrbot.api import logger
 from astrbot.api.provider import LLMResponse
 
 
-@register("enhanced_groupchat", "DeepMind", "打破前缀限制的群聊强化深度互动插件", "1.0.0")
+@register("enhanced_groupchat", "olozhika", "打破前缀限制的群聊强化深度互动插件", "1.0.0")
 class EnhancedGroupChatPlugin(Star):
     def __init__(self, context: Context, config: Dict[str, Any] = None):
         super().__init__(context)
@@ -160,6 +160,29 @@ class EnhancedGroupChatPlugin(Star):
         state = self._get_session_state(session_id)
         now = time.time()
 
+        # 1.6 消息去重（防止相同消息在短时间内因为网络重试/超时投递导致多次记录与重复回复）
+        msg_id = getattr(event, "message_id", None) or (event.message_obj.message_id if hasattr(event.message_obj, "message_id") else None)
+        msg_sig = f"{sender_id}:{message_str}"
+        
+        last_msg_id = state.get("last_msg_id")
+        last_msg_sig = state.get("last_msg_sig")
+        last_msg_time = state.get("last_msg_time", 0.0)
+        
+        is_duplicate = False
+        if msg_id and last_msg_id and last_msg_id == msg_id:
+            is_duplicate = True
+        elif last_msg_sig == msg_sig and (now - last_msg_time < 12.0):
+            is_duplicate = True
+            
+        if is_duplicate:
+            logger.info(f"[EnhancedGroupChat] 🚫 监测到过滤群聊重复重试请求 (Sender: {sender_name}, Content: {message_str})，正在静默拦截该事件归档与大模型请求，避免幽灵多回复。")
+            return
+
+        # 更新去重缓存状态
+        state["last_msg_id"] = msg_id
+        state["last_msg_sig"] = msg_sig
+        state["last_msg_time"] = now
+
         # 5.1 超时熔断与安全边界恢复校验
         # 假如因为异常或重启等原因导致 is_llm_generating 依然为 True，超过 60s 强制重置
         if state.get("is_llm_generating") and now - state.get("llm_start_time", 0.0) > 60.0:
@@ -235,10 +258,16 @@ class EnhancedGroupChatPlugin(Star):
 
         # 6. 处理消息的归档与发送
         if is_reply:
-            # 如果触发了回复，我们将此格式化的消息直接当做此次 LLM 请求的最完美 Prompt
+            # 如果触发了回复，我们将带有 <system_reminder> 的内容转换为 Prompt 提交
             # 原生在请求结束及返回回复时，会自动帮我们把该 prompt 和 AI 回复同步追加进 conversation 库中。
+            # 这不仅方便了大模型精准识别发言用户的 Nickname 与当前高精度真实时间戳，
+            # 也能让 local_reminiscence 的聊天记录导出提取器正确地提取发言用户的 Nickname、时间戳 and 完整的剧本格式内容。
+            now_dt = datetime.now()
+            now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+            prompt_str = f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>\n{event.message_str}"
+            
             yield event.request_llm(
-                prompt=event.message_str,
+                prompt=prompt_str,
                 conversation=conv
             )
         else:
@@ -311,6 +340,6 @@ class EnhancedGroupChatPlugin(Star):
 
         asyncio.create_task(delayed_flush())
 
-    def terminate(self):
+    async def terminate(self):
         """插件卸载资源清理"""
         self.session_states.clear()
