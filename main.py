@@ -2,6 +2,7 @@ import time
 import random
 import re
 import asyncio
+import json
 from datetime import datetime
 from typing import Dict, Any
 
@@ -58,11 +59,16 @@ class EnhancedGroupChatPlugin(Star):
                 session_curr_cid,
             )
             if conv:
-                history = conv.content or []
+                history = []
+                if conv.history:
+                    try:
+                        history = json.loads(conv.history)
+                    except Exception:
+                        history = []
                 history.extend(pending)
                 await self.context.conversation_manager.update_conversation(
                     unified_msg_origin=event.unified_msg_origin,
-                    conversation_id=conv.conversation_id,
+                    conversation_id=conv.cid,
                     history=history
                 )
                 logger.info(f"[EnhancedGroupChat] ✅ 成功将 {len(pending)} 条暂存群友发言合并归档至数据库！")
@@ -240,7 +246,12 @@ class EnhancedGroupChatPlugin(Star):
             # 完美地让 AI 在随后的任何时机有充足的历史作为闲聊戏剧文本参考。
             # 构造附带优雅 <system_reminder> 的双 block 消息体，既符合 LLM 的系统前缀读取设计，
             # 也能让 local_reminiscence 的聊天记录导出提取器正确地提取发言用户的 Nickname、时间戳 and 完整的剧本格式内容。
-            history = conv.content or []
+            history = []
+            if conv.history:
+                try:
+                    history = json.loads(conv.history)
+                except Exception:
+                    history = []
             now_dt = datetime.now()
             now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
             
@@ -259,7 +270,7 @@ class EnhancedGroupChatPlugin(Star):
             })
             await self.context.conversation_manager.update_conversation(
                 unified_msg_origin=event.unified_msg_origin,
-                conversation_id=conv.conversation_id,
+                conversation_id=conv.cid,
                 history=history
             )
 
