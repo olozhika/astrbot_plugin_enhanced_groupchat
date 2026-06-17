@@ -86,9 +86,12 @@ class EnhancedGroupChatPlugin(Star):
         session_id = event.session_id
         if session_id:
             state = self._get_session_state(session_id)
-            state["is_llm_generating"] = True
+            # 只有在非生成状态（即真正首次进入锁定）时，才清空暂存。
+            # 如果已经在 generating 状态（可能我们在 on_message 里提前锁定了），则保留当前的 pending_messages
+            if not state.get("is_llm_generating"):
+                state["pending_messages"] = []
+                state["is_llm_generating"] = True
             state["llm_start_time"] = time.time()
-            state["pending_messages"] = []
             logger.info(f"[EnhancedGroupChat] 🔒 检测到群聊 {session_id} 发起了 LLM 回答流，已锁定历史归档。当前时间群聊消息均进入高保真静默缓存块。")
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
@@ -258,16 +261,14 @@ class EnhancedGroupChatPlugin(Star):
 
         # 6. 处理消息的归档与发送
         if is_reply:
-            # 如果触发了回复，我们将带有 <system_reminder> 的内容转换为 Prompt 提交
-            # 原生在请求结束及返回回复时，会自动帮我们把该 prompt 和 AI 回复同步追加进 conversation 库中。
-            # 这不仅方便了大模型精准识别发言用户的 Nickname 与当前高精度真实时间戳，
-            # 也能让 local_reminiscence 的聊天记录导出提取器正确地提取发言用户的 Nickname、时间戳 and 完整的剧本格式内容。
-            now_dt = datetime.now()
-            now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-            prompt_str = f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>\n{event.message_str}"
-            
+            # 立即设置生成状态，锁定状态机，防止后续并发到达的消息再次出发大模型调用
+            state["is_llm_generating"] = True
+            state["llm_start_time"] = time.time()
+            state["pending_messages"] = []
+            logger.info(f"[EnhancedGroupChat] 🔒 [主动锁定] 群聊 {session_id} 决定回复消息，已提前设置 LLM 回答流状态，锁定后续消息归档。")
+
             yield event.request_llm(
-                prompt=prompt_str,
+                prompt=event.message_str,
                 conversation=conv
             )
         else:
