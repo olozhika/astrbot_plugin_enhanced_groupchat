@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import re
@@ -37,6 +38,46 @@ class EnhancedGroupChatPlugin(Star):
                 "pending_messages": [],       # 大模型生成期间缓存的群友发言
             }
         return self.session_states[session_id]
+
+    def _get_uni_nickname(self, sender_id: str) -> str | None:
+        """从 astrbot_plugin_uni_nickname_config.json 配置文件中查询发送者的统一昵称"""
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_config_path
+            config_dir = get_astrbot_config_path()
+        except Exception:
+            try:
+                from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+                config_dir = os.path.join(get_astrbot_data_path(), "config")
+            except Exception:
+                config_dir = "data/config"
+
+        config_file = os.path.join(config_dir, "astrbot_plugin_uni_nickname_config.json")
+        if not os.path.exists(config_file):
+            return None
+
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            mappings = data.get("nickname_mappings", [])
+            sender_id_str = str(sender_id).strip()
+            
+            # 标准匹配：全匹配或者后半段/最后冒号分隔的部分匹配
+            candidates = [sender_id_str]
+            if ":" in sender_id_str:
+                candidates.append(sender_id_str.split(":")[-1])
+            if "_" in sender_id_str:
+                candidates.append(sender_id_str.split("_")[-1])
+
+            for item in mappings:
+                if "," in item:
+                    acc, nick = item.split(",", maxsplit=1)
+                    acc = acc.strip()
+                    nick = nick.strip()
+                    if acc in candidates:
+                        return nick
+        except Exception as e:
+            logger.warning(f"[EnhancedGroupChat] 尝试读取/解析 uni_nickname 配置文件时遇到错误: {e}")
+        return None
 
     async def _flush_pending_messages(self, event: AstrMessageEvent, session_id: str):
         """将生成期间缓存的群友发言追加并合并写入当前会话的数据库中"""
@@ -149,14 +190,18 @@ class EnhancedGroupChatPlugin(Star):
 
         # 获取发言人的群名片或昵称与用户 ID
         sender_id = event.get_sender_id() if hasattr(event, "get_sender_id") else getattr(event, "user_id", "Unknown")
-        sender_name = event.get_sender_name() if hasattr(event, "get_sender_name") else None
         
+        # 优先使用 uni_nickname 的昵称映射，若没有才使用原有获取到的昵称逻辑
+        sender_name = self._get_uni_nickname(sender_id)
         if not sender_name:
-            if hasattr(event.message_obj, "sender") and event.message_obj.sender:
-                sender_name = event.message_obj.sender.nickname or event.message_obj.sender.user_id
-        
-        if not sender_name:
-            sender_name = sender_id
+            sender_name = event.get_sender_name() if hasattr(event, "get_sender_name") else None
+            
+            if not sender_name:
+                if hasattr(event.message_obj, "sender") and event.message_obj.sender:
+                    sender_name = event.message_obj.sender.nickname or event.message_obj.sender.user_id
+            
+            if not sender_name:
+                sender_name = sender_id
 
         formatted_msg = f"[{sender_name}]: {event.message_str}"
 
