@@ -79,7 +79,7 @@ class EnhancedGroupChatPlugin(Star):
             logger.warning(f"[EnhancedGroupChat] 尝试读取/解析 uni_nickname 配置文件时遇到错误: {e}")
         return None
 
-    def _get_group_n(self, group_id: str) -> int:
+    def _get_group_n(self, group_id: str, session_id: str = None) -> int:
         """获取特定群聊的回复几率倒数 n"""
         n_config = self.config.get("n", 10)
         group_id_str = str(group_id).strip()
@@ -104,8 +104,15 @@ class EnhancedGroupChatPlugin(Star):
 
         # 3. 如果是列表且长度非空
         if isinstance(n_config, list):
-            # 获取群号匹配备选项清单
+            # 获取所有可能的候选群号/会话标识进行匹配
             candidates = [group_id_str]
+            if session_id:
+                s_str = str(session_id).strip()
+                candidates.append(s_str)
+                if ":" in s_str:
+                    candidates.append(s_str.split(":")[-1])
+                if "_" in s_str:
+                    candidates.append(s_str.split("_")[-1])
             if ":" in group_id_str:
                 candidates.append(group_id_str.split(":")[-1])
             if "_" in group_id_str:
@@ -130,25 +137,32 @@ class EnhancedGroupChatPlugin(Star):
                     if any(c in candidates for c in cfg_group_candidates):
                         return max(1, cfg_val)
                 elif isinstance(item, str):
-                    # 支持 "123456,10" 这样的字符串项
-                    for sep in [",", ":", "，", "："]:
+                    item = item.strip()
+                    # 循环可能的分割符，从右至左 (rsplit) 分割，兼容包含冒号的复杂会话ID
+                    cfg_group = None
+                    cfg_val = None
+                    for sep in [",", "，", ":", "："]:
                         if sep in item:
-                            parts = item.split(sep, maxsplit=1)
-                            cfg_group = parts[0].strip()
+                            parts = item.rsplit(sep, 1)
                             try:
-                                cfg_val = int(parts[1].strip())
+                                cfg_val_test = int(parts[1].strip())
+                                cfg_group = parts[0].strip()
+                                cfg_val = cfg_val_test
+                                break  # 成功解析出一个尾部整数，直接终止分隔符循环
                             except (ValueError, TypeError):
                                 continue
                                 
-                            cfg_group_candidates = [cfg_group]
-                            if ":" in cfg_group:
-                                cfg_group_candidates.append(cfg_group.split(":")[-1])
-                            if "_" in cfg_group:
-                                cfg_group_candidates.append(cfg_group.split("_")[-1])
-                                
-                            if any(c in candidates for c in cfg_group_candidates):
-                                return max(1, cfg_val)
-                            break
+                    if cfg_group is None or cfg_val is None:
+                        continue
+                        
+                    cfg_group_candidates = [cfg_group]
+                    if ":" in cfg_group:
+                        cfg_group_candidates.append(cfg_group.split(":")[-1])
+                    if "_" in cfg_group:
+                        cfg_group_candidates.append(cfg_group.split("_")[-1])
+                        
+                    if any(c in candidates for c in cfg_group_candidates):
+                        return max(1, cfg_val)
         return 10
 
     def _prune_unread_history(self, history: list) -> tuple[list, int]:
@@ -427,7 +441,7 @@ class EnhancedGroupChatPlugin(Star):
 
         M = self.config.get("M", 3.0)
         N = self.config.get("N", 5.0)
-        n = self._get_group_n(group_id)
+        n = self._get_group_n(group_id, session_id=session_id)
 
         # 检测当前的“连续窥屏”超时状态转移
         if state["status"] == "peeping":
