@@ -79,6 +79,156 @@ class EnhancedGroupChatPlugin(Star):
             logger.warning(f"[EnhancedGroupChat] 尝试读取/解析 uni_nickname 配置文件时遇到错误: {e}")
         return None
 
+    def _get_group_n(self, group_id: str) -> int:
+        """获取特定群聊的回复几率倒数 n"""
+        n_config = self.config.get("n", 10)
+        group_id_str = str(group_id).strip()
+        
+        # 1. 如果 n_config 本身是数字，直接返回
+        if isinstance(n_config, (int, float)):
+            return max(1, int(n_config))
+            
+        # 2. 如果 n_config 是字符串，并且是纯数字，直接返回数字
+        if isinstance(n_config, str):
+            n_config_trimmed = n_config.strip()
+            if n_config_trimmed.isdigit():
+                return max(1, int(n_config_trimmed))
+            # 否则尝试 JSON 解析
+            if n_config_trimmed.startswith("[") or n_config_trimmed.startswith("{"):
+                try:
+                    n_config = json.loads(n_config_trimmed)
+                except Exception as e:
+                    logger.warning(f"[EnhancedGroupChat] 尝试将 n 字符串解析为 JSON 失败: {e}")
+            else:
+                return 10
+
+        # 3. 如果是列表且长度非空
+        if isinstance(n_config, list):
+            # 获取群号匹配备选项清单
+            candidates = [group_id_str]
+            if ":" in group_id_str:
+                candidates.append(group_id_str.split(":")[-1])
+            if "_" in group_id_str:
+                candidates.append(group_id_str.split("_")[-1])
+                
+            for item in n_config:
+                if isinstance(item, list) and len(item) >= 2:
+                    cfg_group = str(item[0]).strip()
+                    try:
+                        cfg_val = int(item[1])
+                    except (ValueError, TypeError):
+                        continue
+                        
+                    # 判断当前群号是否与配置里的群号匹配
+                    cfg_group_candidates = [cfg_group]
+                    if ":" in cfg_group:
+                        cfg_group_candidates.append(cfg_group.split(":")[-1])
+                    if "_" in cfg_group:
+                        cfg_group_candidates.append(cfg_group.split("_")[-1])
+                        
+                    # 如果有任何交集
+                    if any(c in candidates for c in cfg_group_candidates):
+                        return max(1, cfg_val)
+                elif isinstance(item, str):
+                    # 支持 "123456,10" 这样的字符串项
+                    for sep in [",", ":", "，", "："]:
+                        if sep in item:
+                            parts = item.split(sep, maxsplit=1)
+                            cfg_group = parts[0].strip()
+                            try:
+                                cfg_val = int(parts[1].strip())
+                            except (ValueError, TypeError):
+                                continue
+                                
+                            cfg_group_candidates = [cfg_group]
+                            if ":" in cfg_group:
+                                cfg_group_candidates.append(cfg_group.split(":")[-1])
+                            if "_" in cfg_group:
+                                cfg_group_candidates.append(cfg_group.split("_")[-1])
+                                
+                            if any(c in candidates for c in cfg_group_candidates):
+                                return max(1, cfg_val)
+                            break
+        return 10
+
+    def _prune_unread_history(self, history: list) -> tuple[list, int]:
+        """对于触发回复的时刻，修剪未读的聊天历史，只保留最后的 L 条、最开始 of 5 条与包含特定关键词的消息"""
+        # 1. 寻找 LLM 最后的回复 (role 为 assistant)
+        last_assistant_idx = -1
+        for idx in range(len(history) - 1, -1, -1):
+            if history[idx].get("role") == "assistant":
+                last_assistant_idx = idx
+                break
+        
+        # 2. 如果没有未读消息 (例如 history 为空，或者最后一条即是 assistant)
+        if last_assistant_idx >= len(history) - 1:
+            return history, 0
+
+        # 未读消息列表
+        U = history[last_assistant_idx + 1:]
+        
+        # 3. 解析配置中的 L 和 keep_keywords
+        L_val = self.config.get("L", 15)
+        try:
+            L_val = int(L_val)
+        except (ValueError, TypeError):
+            L_val = 15
+        L_val = max(1, L_val)
+
+        keep_keywords_str = self.config.get("keep_keywords", "").strip()
+        keywords = []
+        if keep_keywords_str:
+            keywords = [k.strip().lower() for k in re.split(r'[\s,，]+', keep_keywords_str) if k.strip()]
+
+        def extract_text(content) -> str:
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                texts = []
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        texts.append(str(item["text"]))
+                    elif isinstance(item, str):
+                        texts.append(item)
+                return " ".join(texts)
+            return ""
+
+        # 4. 判断未读消息中哪些需要保留
+        keep_indices = []
+        len_U = len(U)
+        for i in range(len_U):
+            msg = U[i]
+            msg_text = extract_text(msg.get("content", "")).lower()
+            has_keyword = any(kw in msg_text for kw in keywords) if keywords else False
+            
+            # 保留条件：前 5 条，或后 L 条，或含有触发保留关键词
+            if i < 5 or i >= len_U - L_val or has_keyword:
+                keep_indices.append(i)
+
+        keep_indices_set = set(keep_indices)
+        total_deleted = len_U - len(keep_indices_set)
+
+        # 5. 如果没有删除任何消息，则直接返回原始历史
+        if total_deleted <= 0:
+            return history, 0
+
+        # 6. 有删除，开始重构未读消息 U，并在删掉消息记录的地方构造一条系统提示
+        new_U = []
+        last_idx = -1
+        for idx in sorted(list(keep_indices_set)):
+            gap = idx - last_idx - 1
+            if gap > 0:
+                new_U.append({
+                    "role": "user",
+                    "content": f"<system_reminder>系统提示：由于未读消息过长，此处已自动略过 {gap} 条普通聊天记录，以避免上下文过长。</system_reminder>"
+                })
+            new_U.append(U[idx])
+            last_idx = idx
+
+        # 重新拼接并返回
+        pruned_history = history[:last_assistant_idx + 1] + new_U
+        return pruned_history, total_deleted
+
     async def _flush_pending_messages(self, event: AstrMessageEvent, session_id: str):
         """将生成期间缓存的群友发言追加并合并写入当前会话的数据库中"""
         state = self._get_session_state(session_id)
@@ -277,7 +427,7 @@ class EnhancedGroupChatPlugin(Star):
 
         M = self.config.get("M", 3.0)
         N = self.config.get("N", 5.0)
-        n = self.config.get("n", 10)
+        n = self._get_group_n(group_id)
 
         # 检测当前的“连续窥屏”超时状态转移
         if state["status"] == "peeping":
@@ -311,6 +461,24 @@ class EnhancedGroupChatPlugin(Star):
             state["llm_start_time"] = time.time()
             state["pending_messages"] = []
             logger.info(f"[EnhancedGroupChat] 🔒 [主动锁定] 群聊 {session_id} 决定回复消息，已提前设置 LLM 回答流状态，锁定后续消息归档。")
+
+            # 提前修剪未读聊天历史记录，避免上下文过长
+            history = []
+            if conv.history:
+                try:
+                    history = json.loads(conv.history)
+                except Exception:
+                    history = []
+            if history:
+                pruned_history, deleted_count = self._prune_unread_history(history)
+                if deleted_count > 0:
+                    logger.info(f"[EnhancedGroupChat] ✂️ 检测到未读消息在回复前已积攒过多，本插件已修剪并略去了 {deleted_count} 条普通上下文消息。")
+                    conv.history = json.dumps(pruned_history, ensure_ascii=False)
+                    await self.context.conversation_manager.update_conversation(
+                        unified_msg_origin=event.unified_msg_origin,
+                        conversation_id=conv.cid,
+                        history=pruned_history
+                    )
 
             yield event.request_llm(
                 prompt=event.message_str,
