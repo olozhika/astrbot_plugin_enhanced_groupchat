@@ -609,8 +609,26 @@ class EnhancedGroupChatPlugin(Star):
         if not session_id:
             return
 
-        now = time.time()
         state = self._get_session_state(session_id)
+
+        # 模拟打字延迟：根据回复字数 / 3 * 系数 等待后发送
+        coefficient = self.config.get("typing_speed_coefficient", 1.0)
+        if coefficient > 0:
+            try:
+                coefficient = float(coefficient)
+            except (ValueError, TypeError):
+                coefficient = 1.0
+            text = resp.completion_text
+            delay = (len(text) / 3.0) * coefficient
+            if delay > 0:
+                logger.info(
+                    f"[EnhancedGroupChat] ⌨️ AI 回复共 {len(text)} 字，将在 {delay:.1f} 秒后发送（打字速度系数: {coefficient}）"
+                )
+                # 刷新 llm_start_time，防止 on_message 中的 60s 超时熔断误触发
+                state["llm_start_time"] = time.time()
+                await asyncio.sleep(delay)
+
+        now = time.time()
 
         # 1. 状态改变和连击维护
         if state["status"] == "probabilistic":
