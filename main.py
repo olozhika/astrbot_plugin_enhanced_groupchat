@@ -377,7 +377,7 @@ class EnhancedGroupChatPlugin(Star):
             from astrbot.core.message.components import At
 
             for comp in event.message_obj.message:
-                if isinstance(comp, At) and str(comp.qq) == str(self.context.robot_id):
+                if isinstance(comp, At) and str(comp.qq) == str(event.get_self_id()):
                     has_at_bot = True
                     break
 
