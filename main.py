@@ -42,6 +42,9 @@ class EnhancedGroupChatPlugin(Star):
                 "post_peep_count": 0,  # 退出窥屏后已记录的消息数
                 "rolling_buffer": [],  # L条滚动缓存
                 "has_discarded_messages": False,  # 是否有过丢弃行为
+                "silent_countdown": 0,  # 静默倒计时，>0时跳过回复
+                "last_flushed_buffer_snapshot": None,  # 上一次刷入历史的滚动缓存快照
+                "undo_buffer_requested": False,  # 是否请求撤销缓存消息写入
             }
         return self.session_states[session_id]
 
@@ -117,9 +120,7 @@ class EnhancedGroupChatPlugin(Star):
                     if acc in candidates:
                         return nick
         except Exception as e:
-            logger.warning(
-                f"[APEG] 尝试读取/解析 uni_nickname 配置文件时遇到错误: {e}"
-            )
+            logger.warning(f"[APEG] 尝试读取/解析 uni_nickname 配置文件时遇到错误: {e}")
         return None
 
     def _get_group_n(self, group_id: str, session_id: str = None) -> int:
@@ -141,9 +142,7 @@ class EnhancedGroupChatPlugin(Star):
                 try:
                     n_config = json.loads(n_config_trimmed)
                 except Exception as e:
-                    logger.warning(
-                        f"[APEG] 尝试将 n 字符串解析为 JSON 失败: {e}"
-                    )
+                    logger.warning(f"[APEG] 尝试将 n 字符串解析为 JSON 失败: {e}")
             else:
                 return 10
 
@@ -210,92 +209,8 @@ class EnhancedGroupChatPlugin(Star):
                         return max(1, cfg_val)
         return 10
 
-    def _prune_unread_history(self, history: list) -> tuple[list, int]:
-        """对于触发回复的时刻，修剪未读的聊天历史，只保留最后的 L 条、最开始 of 5 条与包含特定关键词的消息"""
-        # 1. 寻找 LLM 最后的回复 (role 为 assistant)
-        last_assistant_idx = -1
-        for idx in range(len(history) - 1, -1, -1):
-            if history[idx].get("role") == "assistant":
-                last_assistant_idx = idx
-                break
-
-        # 2. 如果没有未读消息 (例如 history 为空，或者最后一条即是 assistant)
-        if last_assistant_idx >= len(history) - 1:
-            return history, 0
-
-        # 未读消息列表
-        U = history[last_assistant_idx + 1 :]
-
-        # 3. 解析配置中的 L 和 keep_keywords
-        L_val = self.config.get("L", 15)
-        try:
-            L_val = int(L_val)
-        except (ValueError, TypeError):
-            L_val = 15
-        L_val = max(1, L_val)
-
-        keep_keywords_str = self.config.get("keep_keywords", "").strip()
-        keywords = []
-        if keep_keywords_str:
-            keywords = [
-                k.strip().lower()
-                for k in re.split(r"[\s,，]+", keep_keywords_str)
-                if k.strip()
-            ]
-
-        def extract_text(content) -> str:
-            if isinstance(content, str):
-                return content
-            elif isinstance(content, list):
-                texts = []
-                for item in content:
-                    if isinstance(item, dict) and "text" in item:
-                        texts.append(str(item["text"]))
-                    elif isinstance(item, str):
-                        texts.append(item)
-                return " ".join(texts)
-            return ""
-
-        # 4. 判断未读消息中哪些需要保留
-        keep_indices = []
-        len_U = len(U)
-        for i in range(len_U):
-            msg = U[i]
-            msg_text = extract_text(msg.get("content", "")).lower()
-            has_keyword = any(kw in msg_text for kw in keywords) if keywords else False
-
-            # 保留条件：前 5 条，或后 L 条，或含有触发保留关键词
-            if i < 5 or i >= len_U - L_val or has_keyword:
-                keep_indices.append(i)
-
-        keep_indices_set = set(keep_indices)
-        total_deleted = len_U - len(keep_indices_set)
-
-        # 5. 如果没有删除任何消息，则直接返回原始历史
-        if total_deleted <= 0:
-            return history, 0
-
-        # 6. 有删除，开始重构未读消息 U，并在删掉消息记录的地方构造一条系统提示
-        new_U = []
-        last_idx = -1
-        for idx in sorted(list(keep_indices_set)):
-            gap = idx - last_idx - 1
-            if gap > 0:
-                new_U.append(
-                    {
-                        "role": "user",
-                        "content": f"<system_reminder>系统提示：由于未读消息过长，此处已自动略过 {gap} 条普通聊天记录，以避免上下文过长。</system_reminder>",
-                    }
-                )
-            new_U.append(U[idx])
-            last_idx = idx
-
-        # 重新拼接并返回
-        pruned_history = history[: last_assistant_idx + 1] + new_U
-        return pruned_history, total_deleted
-
     async def _flush_pending_messages(self, event: AstrMessageEvent, session_id: str):
-        """将生成期间缓存的群友发言追加并合并写入当前会话的数据库中"""
+        """将生成期间缓存的群友发言按时间顺序插入到 AI 回复之前"""
         state = self._get_session_state(session_id)
         pending = state.get("pending_messages", [])
         if not pending:
@@ -327,7 +242,17 @@ class EnhancedGroupChatPlugin(Star):
                         history = json.loads(conv.history)
                     except Exception:
                         history = []
-                history.extend(pending)
+                last_asst_idx = -1
+                for i in range(len(history) - 1, -1, -1):
+                    if history[i].get("role") == "assistant":
+                        last_asst_idx = i
+                        break
+                if last_asst_idx >= 0:
+                    history = (
+                        history[:last_asst_idx] + pending + history[last_asst_idx:]
+                    )
+                else:
+                    history.extend(pending)
                 await self.context.conversation_manager.update_conversation(
                     unified_msg_origin=event.unified_msg_origin,
                     conversation_id=conv.cid,
@@ -344,6 +269,53 @@ class EnhancedGroupChatPlugin(Star):
         finally:
             state["pending_messages"] = []
 
+    async def _undo_buffer_flush(self, event: AstrMessageEvent, session_id: str):
+        """撤销上一次滚动缓存写入历史数据库的操作"""
+        state = self._get_session_state(session_id)
+        snapshot = state.get("last_flushed_buffer_snapshot")
+        if not snapshot:
+            return
+        try:
+            session_curr_cid = (
+                await self.context.conversation_manager.get_curr_conversation_id(
+                    event.unified_msg_origin
+                )
+            )
+            if not session_curr_cid:
+                return
+            conv = await self.context.conversation_manager.get_conversation(
+                event.unified_msg_origin,
+                session_curr_cid,
+            )
+            if not conv or not conv.history:
+                return
+            history = json.loads(conv.history)
+            if not history:
+                return
+            snapshot_contents = frozenset(
+                json.dumps(m.get("content"), sort_keys=True, ensure_ascii=False)
+                for m in snapshot
+            )
+            filtered = [
+                m
+                for m in history
+                if json.dumps(m.get("content"), sort_keys=True, ensure_ascii=False)
+                not in snapshot_contents
+            ]
+            removed = len(history) - len(filtered)
+            if removed > 0:
+                await self.context.conversation_manager.update_conversation(
+                    unified_msg_origin=event.unified_msg_origin,
+                    conversation_id=conv.cid,
+                    history=filtered,
+                )
+                logger.info(f"[APEG] 🔙 已撤销 {removed} 条滚动缓存消息的历史写回。")
+        except Exception as e:
+            logger.error(f"[APEG] 撤销缓存写回时出错: {e}", exc_info=True)
+        finally:
+            state["undo_buffer_requested"] = False
+            state["last_flushed_buffer_snapshot"] = None
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any):
         """监听 LLM 发起请求。无论是本插件唤醒还是原生前缀、@ 机器人唤醒，都对该群进行锁定标记，防止消息被覆盖丢失"""
@@ -353,12 +325,113 @@ class EnhancedGroupChatPlugin(Star):
         session_id = event.session_id
         if session_id:
             state = self._get_session_state(session_id)
+
+            # 静默期拦截：n条内不响应任何LLM请求（包括@唤醒、管道原生唤起等）
+            if state.get("silent_countdown", 0) > 0:
+                state["silent_countdown"] -= 1
+                sender_id = (
+                    event.get_sender_id()
+                    if hasattr(event, "get_sender_id")
+                    else "Unknown"
+                )
+                sender_name = self._get_uni_nickname(sender_id) or (
+                    event.get_sender_name()
+                    if hasattr(event, "get_sender_name")
+                    else None
+                )
+                if not sender_name:
+                    sender_name = sender_id
+                now_dt = datetime.now()
+                now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+                record = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": event.message_str},
+                        {
+                            "type": "text",
+                            "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
+                        },
+                    ],
+                }
+                if req.conversation and req.conversation.history:
+                    try:
+                        history = json.loads(req.conversation.history)
+                    except Exception:
+                        history = []
+                    history.append(record)
+                    req.conversation.history = json.dumps(history, ensure_ascii=False)
+                    await self.context.conversation_manager.update_conversation(
+                        unified_msg_origin=event.unified_msg_origin,
+                        conversation_id=req.conversation.cid,
+                        history=history,
+                    )
+                logger.info(
+                    f"[APEG] 🔇 静默期拦截LLM请求（剩余 {state['silent_countdown']} 条），已记录但不回复。"
+                )
+                event.stop_event()
+                return
+
             # 只有在非生成状态（即真正首次进入锁定）时，才清空暂存。
             # 如果已经在 generating 状态（可能我们在 on_message 里提前锁定了），则保留当前的 pending_messages
             if not state.get("is_llm_generating"):
                 state["pending_messages"] = []
                 state["is_llm_generating"] = True
             state["llm_start_time"] = time.time()
+
+            # 注入退出窥屏工具（群聊 LLM 请求均可见）
+            from astrbot.core.agent.tool import FunctionTool, ToolSet
+
+            n_val = self._get_group_n(event.get_group_id(), session_id=session_id)
+            session_id_local = session_id
+
+            async def _exit_peeping_handler(ev: AstrMessageEvent, **kwargs):
+                s = self._get_session_state(session_id_local)
+                reason = kwargs.get("reason", "")
+                s["silent_countdown"] = n_val
+                s["status"] = "probabilistic"
+                s["just_exited_peeping"] = False
+                s["post_peep_count"] = 5
+                s["undo_buffer_requested"] = True
+                s["rolling_buffer"] = []
+                s["has_discarded_messages"] = False
+                log_suffix = f" 原因: {reason}" if reason else ""
+                logger.info(
+                    f"[APEG] 🔇 AI 选择退出追回复模式，接下来 {n_val} 条消息保持静默。{log_suffix}"
+                )
+                if reason:
+                    return f"已退出追回复模式（{reason}）。接下来 {n_val} 条消息我不会发言，但会默默看大家聊天。"
+                return f"已退出追回复模式。接下来 {n_val} 条消息我不会发言，但会默默看大家聊天。"
+
+            tool = FunctionTool(
+                name="exit_peeping_mode",
+                description="退出当前的追回复模式，在接下来若干条消息中保持沉默不再自动回复。适用于对当前群聊内容不感兴趣、不想参与讨论或群友不礼貌等场景。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "退出原因（可选）",
+                        },
+                    },
+                },
+                handler=_exit_peeping_handler,
+            )
+            if req.func_tool is None:
+                req.func_tool = ToolSet()
+            req.func_tool.add_tool(tool)
+
+            # 注入群聊发言人识别提示词
+            speaker_note = (
+                "\n\n【群聊提醒】"
+                "你在一个有多人聊天的群聊里。当对话中连续出现多条 user 消息时，"
+                "每条消息的格式如下："
+                '{"role": "user", "content": [{"type": "text", "text": "消息内容"}, {"type": "text", "text": "<system_reminder>User ID: 群友ID, Nickname: 昵称\nGroup name: 群名(可能不显示)\nCurrent datetime: 时间 (CST)</system_reminder>"}]}'
+                "请逐条留意，不要默认连续消息来自同一个人。"
+                "准确知道每句话是谁说的，你才能自然地参与进来。"
+            )
+            if speaker_note not in req.system_prompt:
+                req.system_prompt += speaker_note
+
             logger.info(
                 f"[APEG] 🔒 检测到群聊 {session_id} 发起了 LLM 回答流，已锁定历史归档。当前时间群聊消息均进入高保真静默缓存块。"
             )
@@ -443,7 +516,7 @@ class EnhancedGroupChatPlugin(Star):
             if not sender_name:
                 sender_name = sender_id
 
-        formatted_msg = f"[{sender_name}]: {event.message_str}"
+        formatted_msg = event.message_str
 
         state = self._get_session_state(session_id)
         now = time.time()
@@ -496,11 +569,11 @@ class EnhancedGroupChatPlugin(Star):
             record = {
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": event.message_str},
                     {
                         "type": "text",
                         "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
                     },
-                    {"type": "text", "text": event.message_str},
                 ],
             }
             state["pending_messages"].append(record)
@@ -524,9 +597,7 @@ class EnhancedGroupChatPlugin(Star):
             session_curr_cid,
         )
         if not conv:
-            logger.warning(
-                f"[APEG] 无法读取当前群聊会话: {event.unified_msg_origin}"
-            )
+            logger.warning(f"[APEG] 无法读取当前群聊会话: {event.unified_msg_origin}")
             return
 
         M = self.config.get("M", 3.0)
@@ -574,6 +645,14 @@ class EnhancedGroupChatPlugin(Star):
                     f"[APEG] 群聊 {session_id} 突破 1/{n} 机率触发，将积极加入闲聊：{formatted_msg}"
                 )
 
+        # 静默期检查：AI 主动退出后，n 条消息内不回复
+        if state.get("silent_countdown", 0) > 0:
+            is_reply = False
+            state["silent_countdown"] -= 1
+            logger.info(
+                f"[APEG] 🔇 群聊 {session_id} 静默期剩余 {state['silent_countdown']} 条消息，跳过回复。"
+            )
+
         # 6. 处理消息的归档与发送
         if is_reply:
             # 立即设置生成状态，锁定状态机，防止后续并发到达的消息再次出发大模型调用
@@ -586,6 +665,9 @@ class EnhancedGroupChatPlugin(Star):
 
             # 唤醒前把滚动缓存中的消息写入历史
             buffer = state.get("rolling_buffer", [])
+            # 保存缓存快照，用于可能的回滚（如果未消费的快照尚在，则不覆盖）
+            if not state.get("undo_buffer_requested"):
+                state["last_flushed_buffer_snapshot"] = list(buffer) if buffer else None
             if buffer:
                 history = []
                 if conv.history:
@@ -601,7 +683,7 @@ class EnhancedGroupChatPlugin(Star):
                         "content": [
                             {
                                 "type": "text",
-                                "text": "<system_reminder>提示：在你未参与聊天期间，有部分普通聊天记录因历史记录过长被过滤丢弃。</system_reminder>",
+                                "text": "<system_reminder>在你不在线期间，由于消息太长，略去了一段不相关的聊天记录。</system_reminder>",
                             }
                         ],
                     }
@@ -616,6 +698,7 @@ class EnhancedGroupChatPlugin(Star):
                     conversation_id=conv.cid,
                     history=history,
                 )
+                conv.history = json.dumps(history, ensure_ascii=False)
                 logger.info(
                     f"[APEG] 📤 群聊 {session_id} 唤醒前已将 {len(buffer)} 条缓存消息写入历史"
                 )
@@ -625,26 +708,6 @@ class EnhancedGroupChatPlugin(Star):
             # 重置退出窥屏相关状态
             state["just_exited_peeping"] = False
             state["post_peep_count"] = 0
-
-            # 提前修剪未读聊天历史记录，避免上下文过长
-            history = []
-            if conv.history:
-                try:
-                    history = json.loads(conv.history)
-                except Exception:
-                    history = []
-            if history:
-                pruned_history, deleted_count = self._prune_unread_history(history)
-                if deleted_count > 0:
-                    logger.info(
-                        f"[APEG] ✂️ 检测到未读消息在回复前已积攒过多，本插件已修剪并略去了 {deleted_count} 条普通上下文消息。"
-                    )
-                    conv.history = json.dumps(pruned_history, ensure_ascii=False)
-                    await self.context.conversation_manager.update_conversation(
-                        unified_msg_origin=event.unified_msg_origin,
-                        conversation_id=conv.cid,
-                        history=pruned_history,
-                    )
 
             yield event.request_llm(prompt=event.message_str, conversation=conv)
         else:
@@ -656,11 +719,11 @@ class EnhancedGroupChatPlugin(Star):
             new_message = {
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": event.message_str},
                     {
                         "type": "text",
                         "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
                     },
-                    {"type": "text", "text": event.message_str},
                 ],
             }
 
@@ -712,59 +775,39 @@ class EnhancedGroupChatPlugin(Star):
                         )
                 # 情况2：进入滚动缓存模式
                 else:
-                    # 检查消息是否包含关键词
-                    if self._message_contains_keywords(new_message["content"]):
-                        # 包含关键词，直接记录到历史
-                        history = []
-                        if conv.history:
-                            try:
-                                history = json.loads(conv.history)
-                            except Exception:
-                                history = []
-                        history.append(new_message)
-                        await self.context.conversation_manager.update_conversation(
-                            unified_msg_origin=event.unified_msg_origin,
-                            conversation_id=conv.cid,
-                            history=history,
-                        )
-                        logger.info(
-                            f"[APEG] 🔑 群聊 {session_id} 消息包含关键词，直接记录到历史"
-                        )
-                    else:
-                        # 不包含关键词，添加到滚动缓存
-                        buffer = state["rolling_buffer"]
-                        buffer.append(new_message)
+                    buffer = state["rolling_buffer"]
+                    buffer.append(new_message)
 
-                        # 如果缓存超过L条，移除最老的一条
-                        if len(buffer) > L_val:
-                            oldest = buffer.pop(0)
-                            # 检查最老的消息是否包含关键词
-                            if self._message_contains_keywords(oldest["content"]):
-                                # 包含关键词，记录到历史
-                                history = []
-                                if conv.history:
-                                    try:
-                                        history = json.loads(conv.history)
-                                    except Exception:
-                                        history = []
-                                history.append(oldest)
-                                await self.context.conversation_manager.update_conversation(
-                                    unified_msg_origin=event.unified_msg_origin,
-                                    conversation_id=conv.cid,
-                                    history=history,
-                                )
-                                logger.info(
-                                    f"[APEG] 🔑 群聊 {session_id} 滚动缓存中最老的消息包含关键词，已记录到历史"
-                                )
-                            else:
-                                state["has_discarded_messages"] = True
-                                logger.info(
-                                    f"[APEG] 🗑️ 群聊 {session_id} 滚动缓存中最老的消息不包含关键词，已丢弃"
-                                )
+                    # 如果缓存超过L条，移除最老的一条
+                    if len(buffer) > L_val:
+                        oldest = buffer.pop(0)
+                        # 检查最老的消息是否包含关键词
+                        if self._message_contains_keywords(oldest["content"]):
+                            # 包含关键词，记录到历史
+                            history = []
+                            if conv.history:
+                                try:
+                                    history = json.loads(conv.history)
+                                except Exception:
+                                    history = []
+                            history.append(oldest)
+                            await self.context.conversation_manager.update_conversation(
+                                unified_msg_origin=event.unified_msg_origin,
+                                conversation_id=conv.cid,
+                                history=history,
+                            )
+                            logger.info(
+                                f"[APEG] 🔑 群聊 {session_id} 滚动缓存中最老的消息包含关键词，已记录到历史"
+                            )
+                        else:
+                            state["has_discarded_messages"] = True
+                            logger.info(
+                                f"[APEG] 🗑️ 群聊 {session_id} 滚动缓存中最老的消息不包含关键词，已丢弃"
+                            )
 
-                        logger.info(
-                            f"[APEG] 📥 群聊 {session_id} 消息已加入滚动缓存 (当前缓存: {len(buffer)}/{L_val})"
-                        )
+                    logger.info(
+                        f"[APEG] 📥 群聊 {session_id} 消息已加入滚动缓存 (当前缓存: {len(buffer)}/{L_val})"
+                    )
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -803,7 +846,11 @@ class EnhancedGroupChatPlugin(Star):
         now = time.time()
 
         # 1. 状态改变和连击维护
-        if state["status"] == "probabilistic":
+        if state.get("undo_buffer_requested"):
+            logger.info(
+                f"[APEG] 🔇 群聊 {session_id} AI 已请求退出模式，跳过进入连续窥屏追踪阶段。"
+            )
+        elif state["status"] == "probabilistic":
             state["status"] = "peeping"
             state["peep_start_time"] = now
             logger.info(
@@ -820,6 +867,11 @@ class EnhancedGroupChatPlugin(Star):
         async def delayed_flush():
             await asyncio.sleep(0.5)
             await self._flush_pending_messages(event, session_id)
+            # 撤销缓存消息写入
+            if state.get("undo_buffer_requested") and state.get(
+                "last_flushed_buffer_snapshot"
+            ):
+                await self._undo_buffer_flush(event, session_id)
 
         asyncio.create_task(delayed_flush())
 
