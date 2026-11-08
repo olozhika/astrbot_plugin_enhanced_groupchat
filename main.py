@@ -45,8 +45,80 @@ class EnhancedGroupChatPlugin(Star):
                 "silent_countdown": 0,  # 静默倒计时，>0时跳过回复
                 "last_flushed_buffer_snapshot": None,  # 上一次刷入历史的滚动缓存快照
                 "undo_buffer_requested": False,  # 是否请求撤销缓存消息写入
+                "time_before_messages": [],  # Time_before 等待期间收集的消息
+                "time_before_collecting": False,  # 是否处于 time_before 收集中
+                "time_after_end": 0.0,  # Time_after 静默期结束时间戳
             }
         return self.session_states[session_id]
+
+    def _extract_image_files(self, event) -> list[str]:
+        """从事件中提取图片文件的原始标记（file 字段），用于后续转述。"""
+        from astrbot.core.message.components import Image
+
+        return [
+            comp.file
+            for comp in event.message_obj.message
+            if isinstance(comp, Image)
+        ]
+
+    async def _generate_image_caption(self, image_files: list[str]) -> str:
+        """使用配置的图片转述 Provider 为图片生成文字描述。"""
+        try:
+            cfg = self.context.get_config()
+            provider_id = cfg.get("default_image_caption_provider_id", "")
+            if not provider_id:
+                return ""
+            prov = self.context.get_provider_by_id(provider_id)
+            if not prov:
+                return ""
+            provider_settings = cfg.get("provider_settings", {})
+            img_cap_prompt = provider_settings.get(
+                "image_caption_prompt", "Please describe the image."
+            )
+            from astrbot.core.message.components import Image
+
+            paths = []
+            for spec in image_files:
+                img = Image(file=spec)
+                path = await img.convert_to_file_path()
+                paths.append(path)
+            from astrbot.core.utils.media_utils import compress_image
+
+            compressed = []
+            for p in paths:
+                try:
+                    cp = await compress_image(p)
+                    compressed.append(cp)
+                except Exception:
+                    compressed.append(p)
+            llm_resp = await prov.text_chat(
+                prompt=img_cap_prompt,
+                image_urls=compressed,
+            )
+            if llm_resp:
+                return llm_resp.completion_text
+            return ""
+        except Exception as e:
+            logger.error(f"[APEG] 图片转述失败: {e}")
+            return ""
+
+    async def _make_user_record(self, event, sender_id: str, sender_name: str) -> dict:
+        """构造一条用户消息记录，包含身份标签，如有图片则生成转述一并注入。"""
+        now_dt = datetime.now()
+        now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        content = [
+            {"type": "text", "text": event.message_str},
+            {
+                "type": "text",
+                "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
+            },
+        ]
+        image_files = self._extract_image_files(event)
+        if image_files:
+            caption = await self._generate_image_caption(image_files)
+            caption_text = f"<image_caption>{caption}</image_caption>" if caption else "[Image]"
+            content.insert(-1, {"type": "text", "text": caption_text})
+        return {"role": "user", "content": content}
 
     def _message_contains_keywords(self, content) -> bool:
         """检查消息内容是否包含保留关键词"""
@@ -325,6 +397,83 @@ class EnhancedGroupChatPlugin(Star):
         session_id = event.session_id
         if session_id:
             state = self._get_session_state(session_id)
+            now = time.time()
+
+            # Time_before 收集中：@消息也收入 batch
+            if state.get("time_before_collecting"):
+                sender_id = (
+                    event.get_sender_id()
+                    if hasattr(event, "get_sender_id")
+                    else "Unknown"
+                )
+                sender_name = self._get_uni_nickname(sender_id) or (
+                    event.get_sender_name()
+                    if hasattr(event, "get_sender_name")
+                    else None
+                ) or sender_id
+                now_dt = datetime.now()
+                now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+                record = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": event.message_str},
+                        {
+                            "type": "text",
+                            "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
+                        },
+                    ],
+                }
+                state["time_before_messages"].append({
+                    "record": record,
+                    "text": event.message_str,
+                })
+                logger.info(
+                    f"[APEG] ⏳ 群聊 {session_id} 收集中，@消息已入 batch（共 {len(state['time_before_messages'])} 条）"
+                )
+                event.stop_event()
+                return
+
+            # Time_after 静默期：记录消息到历史，然后停止 LLM 请求
+            if state.get("time_after_end", 0) > now:
+                sender_id = (
+                    event.get_sender_id()
+                    if hasattr(event, "get_sender_id")
+                    else "Unknown"
+                )
+                sender_name = self._get_uni_nickname(sender_id) or (
+                    event.get_sender_name()
+                    if hasattr(event, "get_sender_name")
+                    else None
+                ) or sender_id
+                now_dt = datetime.now()
+                now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+                record = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": event.message_str},
+                        {
+                            "type": "text",
+                            "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
+                        },
+                    ],
+                }
+                if req.conversation and req.conversation.history:
+                    try:
+                        history = json.loads(req.conversation.history)
+                    except Exception:
+                        history = []
+                    history.append(record)
+                    req.conversation.history = json.dumps(history, ensure_ascii=False)
+                    await self.context.conversation_manager.update_conversation(
+                        unified_msg_origin=event.unified_msg_origin,
+                        conversation_id=req.conversation.cid,
+                        history=history,
+                    )
+                logger.info(
+                    f"[APEG] 🔇 群聊 {session_id} 回复后静默期，LLM 请求已被拦截，消息已记录。"
+                )
+                event.stop_event()
+                return
 
             # 静默期拦截：n条内不响应任何LLM请求（包括@唤醒、管道原生唤起等）
             if state.get("silent_countdown", 0) > 0:
@@ -470,7 +619,12 @@ class EnhancedGroupChatPlugin(Star):
 
         message_str = event.message_str.strip() if event.message_str else ""
         if not message_str:
-            return
+            from astrbot.core.message.components import Image
+
+            if not any(
+                isinstance(comp, Image) for comp in event.message_obj.message
+            ):
+                return
 
         # 3. 过滤典型命令：不插手正常的系统级指令消息
         if message_str.startswith(("/", "\\", "!", "！")):
@@ -520,6 +674,31 @@ class EnhancedGroupChatPlugin(Star):
 
         state = self._get_session_state(session_id)
         now = time.time()
+
+        # === Time_before 收集中：将本条消息追加到 batch 中 ===
+        if state.get("time_before_collecting"):
+            now_dt = datetime.now()
+            now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+            batched_record = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": event.message_str},
+                    {
+                        "type": "text",
+                        "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
+                    },
+                ],
+            }
+            state["time_before_messages"].append({
+                "record": batched_record,
+                "text": event.message_str,
+            })
+            logger.info(
+                f"[APEG] ⏳ 群聊 {session_id} 正在收集中({len(state['time_before_messages'])}条)，消息已入 batch：{sender_name}：{event.message_str}"
+            )
+            if event.is_at_or_wake_command:
+                event.stop_event()
+            return
 
         # 1.6 消息去重（防止相同消息在短时间内因为网络重试/超时投递导致多次记录与重复回复）
         msg_id = getattr(event, "message_id", None) or (
@@ -653,21 +832,110 @@ class EnhancedGroupChatPlugin(Star):
                 f"[APEG] 🔇 群聊 {session_id} 静默期剩余 {state['silent_countdown']} 条消息，跳过回复。"
             )
 
+        # Time_after 静默期：AI 回复后的一段时间内不触发新回复
+        time_after = self.config.get("time_after", 5.0)
+        if is_reply and state.get("time_after_end", 0) > now:
+            is_reply = False
+            logger.info(
+                f"[APEG] 🔇 群聊 {session_id} 处于回复后静默期(time_after={time_after}s)，跳过回复。"
+            )
+
         # 6. 处理消息的归档与发送
         if is_reply:
+            time_before = self.config.get("time_before", 3.0) or 0.0
+
             # 立即设置生成状态，锁定状态机，防止后续并发到达的消息再次出发大模型调用
             state["is_llm_generating"] = True
-            state["llm_start_time"] = time.time()
+            state["llm_start_time"] = time.time() + time_before + 60
             state["pending_messages"] = []
             logger.info(
                 f"[APEG] 🔒 [主动锁定] 群聊 {session_id} 决定回复消息，已提前设置 LLM 回答流状态，锁定后续消息归档。"
             )
 
-            # 唤醒前把滚动缓存中的消息写入历史
+            # 保存缓存快照，用于可能的回滚
             buffer = state.get("rolling_buffer", [])
-            # 保存缓存快照，用于可能的回滚（如果未消费的快照尚在，则不覆盖）
             if not state.get("undo_buffer_requested"):
                 state["last_flushed_buffer_snapshot"] = list(buffer) if buffer else None
+
+            if time_before > 0:
+                # === Time_before 批次收集模式 ===
+                state["time_before_collecting"] = True
+                state["time_before_messages"] = []
+                now_dt = datetime.now()
+                now_time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+                trigger_record = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": event.message_str},
+                        {
+                            "type": "text",
+                            "text": f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}\nCurrent datetime: {now_time_str} (UTC)</system_reminder>",
+                        },
+                    ],
+                }
+                state["time_before_messages"].append({
+                    "record": trigger_record,
+                    "text": event.message_str,
+                })
+                logger.info(
+                    f"[APEG] ⏳ 群聊 {session_id} Time_before 等待 {time_before}s，开始收集后续消息..."
+                )
+                await asyncio.sleep(time_before)
+
+                # 收集所有在等待期间到达的消息
+                batched_messages = list(state.get("time_before_messages", []))
+                state["time_before_collecting"] = False
+                state["time_before_messages"] = []
+
+                logger.info(
+                    f"[APEG] ⏳ 群聊 {session_id} Time_before 结束，共收集 {len(batched_messages)} 条消息，准备发送给 LLM。"
+                )
+
+                # 构建历史：flush 滚动缓存 + time_before 批次消息（最后一条除外）
+                history = []
+                if conv.history:
+                    try:
+                        history = json.loads(conv.history)
+                    except Exception:
+                        history = []
+
+                if state.get("has_discarded_messages", False):
+                    discard_reminder = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "<system_reminder>由于消息太长，略去了一段不相关的聊天记录。</system_reminder>",
+                            }
+                        ],
+                    }
+                    history.append(discard_reminder)
+
+                if buffer:
+                    history.extend(buffer)
+
+                # 除最后一条外的所有 batched 消息加入历史
+                for m in batched_messages[:-1]:
+                    history.append(m["record"])
+
+                await self.context.conversation_manager.update_conversation(
+                    unified_msg_origin=event.unified_msg_origin,
+                    conversation_id=conv.cid,
+                    history=history,
+                )
+                conv.history = json.dumps(history, ensure_ascii=False)
+                state["rolling_buffer"] = []
+                state["has_discarded_messages"] = False
+                state["just_exited_peeping"] = False
+                state["post_peep_count"] = 0
+
+                # 用最后一条消息作为 prompt
+                last_prompt = batched_messages[-1]["text"]
+                state["llm_start_time"] = time.time()
+                yield event.request_llm(prompt=last_prompt, conversation=conv)
+                return
+
+            # === Time_before=0，立即回复（原有路径） ===
             if buffer:
                 history = []
                 if conv.history:
@@ -676,21 +944,17 @@ class EnhancedGroupChatPlugin(Star):
                     except Exception:
                         history = []
 
-                # 如果有过丢弃行为，在注入缓存消息之前先注入提示
                 if state.get("has_discarded_messages", False):
                     discard_reminder = {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": "<system_reminder>在你不在线期间，由于消息太长，略去了一段不相关的聊天记录。</system_reminder>",
+                                "text": "<system_reminder>由于消息太长，略去了一段不相关的聊天记录。</system_reminder>",
                             }
                         ],
                     }
                     history.append(discard_reminder)
-                    logger.info(
-                        f"[APEG] 💬 群聊 {session_id} 检测到有过丢弃行为，已注入丢弃提示"
-                    )
 
                 history.extend(buffer)
                 await self.context.conversation_manager.update_conversation(
@@ -705,9 +969,9 @@ class EnhancedGroupChatPlugin(Star):
                 state["rolling_buffer"] = []
                 state["has_discarded_messages"] = False
 
-            # 重置退出窥屏相关状态
             state["just_exited_peeping"] = False
             state["post_peep_count"] = 0
+            state["llm_start_time"] = time.time()
 
             yield event.request_llm(prompt=event.message_str, conversation=conv)
         else:
@@ -844,6 +1108,14 @@ class EnhancedGroupChatPlugin(Star):
                 await asyncio.sleep(delay)
 
         now = time.time()
+
+        # 设置 Time_after 静默期：回复已发送到群，接下来 time_after 秒内不触发新回复
+        time_after = self.config.get("time_after", 5.0)
+        if time_after > 0:
+            state["time_after_end"] = now + time_after
+            logger.info(
+                f"[APEG] 🔇 群聊 {session_id} 回复已发送，接下来 {time_after}s 内不触发新回复。"
+            )
 
         # 1. 状态改变和连击维护
         if state.get("undo_buffer_requested"):
